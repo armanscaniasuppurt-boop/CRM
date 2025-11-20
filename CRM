@@ -204,9 +204,7 @@ class Arman_Part_CRM {
                 .arman-crm-panel-page #wpadminbar { display: none; }
 
                 #arman-personnel-panel {
-                    margin: 0 auto;
-                    padding: 2rem;
-                    max-width: 1400px;
+                    display: flex;
                     min-height: 100vh;
                 }
 
@@ -392,50 +390,78 @@ class Arman_Part_CRM {
                 }
 
                 /* --- Dashboard Layout & Nav --- */
-                 #arman-personnel-panel .crm-header {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
+                .crm-sidebar {
+                    width: 260px;
+                    background: rgba(255, 255, 255, 0.7);
+                    backdrop-filter: blur(15px);
+                    border-left: 1px solid rgba(255, 255, 255, 0.2);
                     padding: 2rem;
-                    background: var(--white-color);
-                    border-radius: var(--border-radius);
-                    box-shadow: var(--box-shadow);
-                    margin-bottom: 2.5rem;
-                    border: 1px solid var(--border-color);
+                    display: flex;
+                    flex-direction: column;
+                    gap: 2rem;
+                    height: 100vh;
+                    position: fixed;
+                    right: 0;
+                    top: 0;
+                    box-shadow: -10px 0 30px rgba(0,0,0,0.1);
+                }
+                .sidebar-header {
+                    text-align: center;
+                    padding-bottom: 1.5rem;
+                    border-bottom: 1px solid var(--border-color);
+                }
+                .sidebar-header h3 {
+                    margin: 0;
+                    color: var(--primary-color);
+                    font-weight: 700;
+                }
+                .crm-content-wrapper {
+                    margin-right: 260px; /* Same as sidebar width */
+                    width: calc(100% - 260px);
+                    padding: 2rem;
+                }
+                 #arman-personnel-panel .crm-header {
+                    background: transparent;
+                    box-shadow: none;
+                    border: none;
+                    padding: 0 0 2rem 0;
+                    margin-bottom: 0;
                  }
                  #arman-personnel-panel .crm-header h2 { 
                     margin: 0; 
-                    font-size: 1.75rem;
+                    font-size: 2rem;
                 }
                 #arman-personnel-panel .crm-header h2:after {
                     display: none;
                 }
                  #arman-personnel-panel .crm-nav { 
                     display: flex;
-                    gap: 1rem;
-                    flex-wrap: wrap;
+                    flex-direction: column;
+                    gap: 0.8rem;
                  }
                  #arman-personnel-panel .crm-nav a { 
-                    padding: 10px 18px;
-                    border-radius: 8px;
-                    background: rgba(52, 152, 219, 0.1);
-                    color: var(--secondary-color);
+                    padding: 14px 20px;
+                    border-radius: 10px;
+                    color: var(--primary-color);
                     font-weight: 600;
                     transition: var(--transition);
+                    display: flex;
+                    align-items: center;
+                    gap: 12px;
                  }
-                 #arman-personnel-panel .crm-nav a:hover { 
-                    background: var(--secondary-color);
-                    color: white;
+                 #arman-personnel-panel .crm-nav a:hover,
+                 #arman-personnel-panel .crm-nav a.active {
+                    background: rgba(52, 152, 219, 0.2);
+                    color: var(--secondary-color);
                     text-decoration: none;
-                    transform: translateY(-2px);
                  }
                  #arman-personnel-panel .crm-nav a.logout { 
-                    background: rgba(231, 76, 60, 0.1);
+                    margin-top: auto;
                     color: var(--accent-color);
                  }
                  #arman-personnel-panel .crm-nav a.logout:hover {
-                    background: var(--accent-color);
-                    color: white;
+                    background: rgba(231, 76, 60, 0.15);
+                    color: var(--accent-color);
                  }
 
                 /* Details page layout */
@@ -685,10 +711,9 @@ class Arman_Part_CRM {
         }
         ?>
         <div id="arman-personnel-panel">
-            <header class="crm-header">
-                <div>
-                    <h2><?php echo esc_html($page_title); ?></h2>
-                    <p style="margin: 0; color: var(--light-text); font-size: 0.95rem;">سیستم مدیریت ارتباط با مشتریان</p>
+            <aside class="crm-sidebar">
+                <div class="sidebar-header">
+                    <h3>آرمان پارت CRM</h3>
                 </div>
                 <nav class="crm-nav">
                     <a href="?crm_page=dashboard" class="<?php echo $current_page == 'dashboard' ? 'active' : ''; ?>">📊 داشبورد</a>
@@ -700,38 +725,47 @@ class Arman_Part_CRM {
                     <a href="?crm_page=archived_finished" class="<?php echo $current_page == 'archived_finished' ? 'active' : ''; ?>">✅ بایگانی (خاتمه یافته)</a>
                     <a href="?crm_action=logout" class="logout">🚪 خروج</a>
                 </nav>
-            </header>
-            
-            <main class="crm-main-content">
-                <?php
-                switch ($current_page) {
-                    case 'add_call':
-                        $this->render_add_call_page();
-                        break;
-                    case 'my_followups':
-                        $this->render_my_followups_page();
-                        break;
-                    case 'archived_paid':
-                        $this->render_archived_list_page('paid', 'پرونده های واریز شده');
-                        break;
-                    case 'archived_finished':
-                        $this->render_archived_list_page('finished', 'پرونده های خاتمه یافته');
-                        break;
-                    case 'customers':
-                        $this->render_customers_page();
-                        break;
-                    case 'products':
-                        $this->render_products_page();
-                        break;
-                    case 'reports':
-                        $this->render_personnel_reports_page();
-                        break;
-                    default:
-                        $this->render_dashboard_home();
-                        break;
-                }
-                ?>
-            </main>
+            </aside>
+
+            <div class="crm-content-wrapper">
+                <header class="crm-header">
+                    <div>
+                        <h2><?php echo esc_html($page_title); ?></h2>
+                        <p style="margin: 0; color: var(--light-text); font-size: 0.95rem;">سیستم مدیریت ارتباط با مشتریان</p>
+                    </div>
+                </header>
+
+                <main class="crm-main-content">
+                    <?php
+                    switch ($current_page) {
+                        case 'add_call':
+                            $this->render_add_call_page();
+                            break;
+                        case 'my_followups':
+                            $this->render_my_followups_page();
+                            break;
+                        case 'archived_paid':
+                            $this->render_archived_list_page('paid', 'پرونده های واریز شده');
+                            break;
+                        case 'archived_finished':
+                            $this->render_archived_list_page('finished', 'پرونده های خاتمه یافته');
+                            break;
+                        case 'customers':
+                            $this->render_customers_page();
+                            break;
+                        case 'products':
+                            $this->render_products_page();
+                            break;
+                        case 'reports':
+                            $this->render_personnel_reports_page();
+                            break;
+                        default:
+                            $this->render_dashboard_home();
+                            break;
+                    }
+                    ?>
+                </main>
+            </div>
         </div>
         <?php
     }
