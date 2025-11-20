@@ -1,0 +1,1901 @@
+<?php
+/**
+ * Plugin Name: Arman Part CRM
+ * Plugin URI: https://armanpart.com/
+ * Description: A simple and practical CRM plugin for Arman Part personnel to manage customer calls and orders.
+ * Version: 1.0.0
+ * Author: Jules
+ * Author URI: https://armanpart.com/
+ * License: GPL-2.0+
+ * License URI: http://www.gnu.org/licenses/gpl-2.0.txt
+ * Text Domain: arman-part-crm
+ */
+
+// If this file is called directly, abort.
+if ( ! defined( 'WPINC' ) ) {
+    die;
+}
+
+// Function to create database tables on plugin activation
+function arman_part_crm_activate() {
+    global $wpdb;
+    $charset_collate = $wpdb->get_charset_collate();
+
+    // Table for Personnel
+    $table_personnel = $wpdb->prefix . 'arman_personnel';
+    $sql_personnel = "CREATE TABLE $table_personnel (
+        id mediumint(9) NOT NULL AUTO_INCREMENT,
+        username varchar(60) NOT NULL,
+        password varchar(255) NOT NULL,
+        display_name varchar(250) NOT NULL,
+        PRIMARY KEY  (id),
+        UNIQUE KEY username (username)
+    ) $charset_collate;";
+
+    // Table for Customers
+    $table_customers = $wpdb->prefix . 'arman_customers';
+    $sql_customers = "CREATE TABLE $table_customers (
+        id bigint(20) NOT NULL AUTO_INCREMENT,
+        name varchar(255) NOT NULL,
+        phone varchar(20) NOT NULL,
+        city varchar(100),
+        vehicle_model varchar(100),
+        is_colleague BOOLEAN NOT NULL DEFAULT 0,
+        PRIMARY KEY  (id),
+        UNIQUE KEY phone (phone)
+    ) $charset_collate;";
+
+    // Table for Follow-ups (was previously calls)
+    $table_followups = $wpdb->prefix . 'arman_followups';
+    $sql_followups = "CREATE TABLE $table_followups (
+        id bigint(20) NOT NULL AUTO_INCREMENT,
+        customer_id bigint(20) NOT NULL,
+        personnel_id mediumint(9) NOT NULL,
+        initial_status varchar(50) NOT NULL, 
+        final_status varchar(50) NOT NULL DEFAULT 'follow_up', -- 'follow_up', 'paid', 'finished'
+        created_at datetime DEFAULT CURRENT_TIMESTAMP NOT NULL,
+        updated_at datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY  (id)
+    ) $charset_collate;";
+
+    // New Table for Call History within a follow-up
+    $table_call_history = $wpdb->prefix . 'arman_call_history';
+    $sql_call_history = "CREATE TABLE $table_call_history (
+        id bigint(20) NOT NULL AUTO_INCREMENT,
+        followup_id bigint(20) NOT NULL,
+        personnel_id mediumint(9) NOT NULL,
+        call_duration int(11),
+        description text,
+        created_at datetime DEFAULT CURRENT_TIMESTAMP NOT NULL,
+        PRIMARY KEY  (id)
+    ) $charset_collate;";
+
+    // Table for Follow-up Products (Inquiries) - Renamed for clarity
+    $table_followup_products = $wpdb->prefix . 'arman_followup_products';
+    $sql_followup_products = "CREATE TABLE $table_followup_products (
+        id bigint(20) NOT NULL AUTO_INCREMENT,
+        followup_id bigint(20) NOT NULL,
+        product_name varchar(255) NOT NULL,
+        price decimal(15,2) DEFAULT 0.00,
+        PRIMARY KEY  (id)
+    ) $charset_collate;";
+
+    require_once( ABSPATH . 'wp-admin/includes/upgrade.php' );
+    dbDelta( $sql_personnel );
+    dbDelta( $sql_customers );
+    dbDelta( $sql_followups );
+    dbDelta( $sql_call_history );
+    dbDelta( $sql_followup_products );
+
+    // Rename old tables if they exist for backward compatibility
+    global $wpdb;
+    if ($wpdb->get_var("SHOW TABLES LIKE '{$wpdb->prefix}arman_calls'") == "{$wpdb->prefix}arman_calls") {
+        $wpdb->query("RENAME TABLE {$wpdb->prefix}arman_calls TO {$wpdb->prefix}arman_followups");
+    }
+    if ($wpdb->get_var("SHOW TABLES LIKE '{$wpdb->prefix}arman_call_products'") == "{$wpdb->prefix}arman_call_products") {
+        $wpdb->query("RENAME TABLE {$wpdb->prefix}arman_call_products TO {$wpdb->prefix}arman_followup_products");
+        // Also rename the column call_id to followup_id
+        if ($wpdb->get_var("SHOW COLUMNS FROM `{$wpdb->prefix}arman_followup_products` LIKE 'call_id'")) {
+            $wpdb->query("ALTER TABLE {$wpdb->prefix}arman_followup_products CHANGE `call_id` `followup_id` BIGINT(20) NOT NULL");
+        }
+    }
+}
+
+register_activation_hook( __FILE__, 'arman_part_crm_activate' );
+
+/**
+ * Main CRM Class
+ */
+class Arman_Part_CRM {
+
+    public function __construct() {
+        // Add admin menu
+        add_action( 'admin_menu', array( $this, 'add_admin_menu' ) );
+        
+        // Add shortcode for the personnel panel
+        add_shortcode( 'arman_part_crm_panel', array( $this, 'render_personnel_panel' ) );
+        
+        // Start session for personnel login
+        add_action( 'init', array( $this, 'start_session' ), 1 );
+
+        // Handle personnel logout
+        add_action( 'init', array( $this, 'handle_logout' ) );
+
+        // Handle CSV Export
+        add_action( 'admin_init', array( $this, 'handle_csv_export' ) );
+
+        // Load styles and scripts for the panel
+        add_action( 'wp_enqueue_scripts', array( $this, 'load_crm_styles_and_scripts' ) );
+
+        // Setup panel page (to remove header/footer)
+        add_action( 'template_redirect', array( $this, 'override_template_for_crm_panel' ) );
+        
+        // AJAX handler for customer search
+        add_action( 'wp_ajax_arman_search_customers', array( $this, 'search_customers_callback' ) );
+        // AJAX handler for product search
+        add_action( 'wp_ajax_arman_search_products', array( $this, 'search_products_callback' ) );
+    }
+
+    /**
+     * Overrides the default template for the page containing the CRM panel shortcode.
+     * This ensures the panel is displayed on a blank page without the theme's header and footer.
+     */
+    public function override_template_for_crm_panel() {
+        global $post;
+
+        if ( is_singular() && is_a( $post, 'WP_Post' ) && has_shortcode( $post->post_content, 'arman_part_crm_panel' ) ) {
+            ?>
+            <!DOCTYPE html>
+            <html <?php language_attributes(); ?>>
+            <head>
+                <meta charset="<?php bloginfo( 'charset' ); ?>">
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <title><?php wp_title( '|', true, 'right' ); ?></title>
+                <?php wp_head(); ?>
+            </head>
+            <body <?php body_class( 'arman-crm-panel-page' ); ?>>
+                <?php
+                    // Execute the shortcode and display its content
+                    echo do_shortcode( $post->post_content );
+                ?>
+                <?php wp_footer(); ?>
+            </body>
+            </html>
+            <?php
+            exit();
+        }
+    }
+    
+    /**
+     * Load inline CSS and JS for the new, modern panel
+     */
+    public function load_crm_styles_and_scripts() {
+        global $post;
+        if ( is_a( $post, 'WP_Post' ) && has_shortcode( $post->post_content, 'arman_part_crm_panel' ) ) {
+            $css = "
+                :root {
+                    --primary-color: #2c3e50;
+                    --secondary-color: #3498db;
+                    --accent-color: #e74c3c;
+                    --success-color: #27ae60;
+                    --warning-color: #f39c12;
+                    --text-color: #2c3e50;
+                    --light-text: #7f8c8d;
+                    --background-color: #f8f9fa;
+                    --white-color: #ffffff;
+                    --border-color: #e0e0e0;
+                    --border-radius: 12px;
+                    --box-shadow: 0 8px 24px rgba(0,0,0,0.1);
+                    --transition: all 0.3s ease;
+                }
+                
+                /* Using a modern Persian font */
+                @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700&display=swap');
+
+                html, body.arman-crm-panel-page {
+                    font-family: 'Vazirmatn', sans-serif;
+                    direction: rtl;
+                    background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+                    color: var(--text-color);
+                    margin: 0;
+                    line-height: 1.6;
+                    min-height: 100vh;
+                }
+                .arman-crm-panel-page #wpadminbar { display: none; }
+
+                #arman-personnel-panel {
+                    margin: 0 auto;
+                    padding: 2rem;
+                    max-width: 1400px;
+                    min-height: 100vh;
+                }
+
+                #arman-personnel-panel h1, #arman-personnel-panel h2, #arman-personnel-panel h3 {
+                    color: var(--primary-color);
+                    font-weight: 700;
+                    margin-bottom: 1.5rem;
+                    position: relative;
+                    padding-bottom: 0.5rem;
+                }
+                
+                #arman-personnel-panel h2:after {
+                    content: '';
+                    position: absolute;
+                    bottom: 0;
+                    right: 0;
+                    width: 60px;
+                    height: 3px;
+                    background: var(--secondary-color);
+                    border-radius: 2px;
+                }
+                
+                #arman-personnel-panel a {
+                    color: var(--secondary-color);
+                    text-decoration: none;
+                    transition: var(--transition);
+                    font-weight: 500;
+                }
+                #arman-personnel-panel a:hover { 
+                    color: var(--primary-color); 
+                    text-decoration: underline;
+                }
+                
+                /* --- Login Form --- */
+                #arman-crm-login-container {
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    min-height: 100vh;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    padding: 2rem;
+                }
+                #arman-crm-login-form {
+                    max-width: 420px;
+                    width: 100%;
+                    padding: 3rem;
+                    background: var(--white-color);
+                    border-radius: var(--border-radius);
+                    box-shadow: var(--box-shadow);
+                    text-align: center;
+                }
+                #arman-crm-login-form h2 {
+                    margin-top: 0;
+                    color: var(--primary-color);
+                }
+                #arman-crm-login-form h2:after {
+                    right: 50%;
+                    transform: translateX(50%);
+                }
+
+                /* --- Forms General --- */
+                #arman-personnel-panel form {
+                    background-color: var(--white-color);
+                    padding: 2.5rem;
+                    border-radius: var(--border-radius);
+                    margin-top: 2rem;
+                    box-shadow: var(--box-shadow);
+                    border: 1px solid var(--border-color);
+                }
+
+                #arman-personnel-panel .form-group {
+                    margin-bottom: 1.5rem;
+                }
+
+                #arman-personnel-panel label {
+                    display: block;
+                    margin-bottom: 0.5rem;
+                    font-weight: 600;
+                    color: var(--primary-color);
+                }
+
+                #arman-personnel-panel input[type='text'],
+                #arman-personnel-panel input[type='password'],
+                #arman-personnel-panel input[type='number'],
+                #arman-personnel-panel input[type='tel'],
+                #arman-personnel-panel textarea,
+                #arman-personnel-panel select {
+                    width: 100%;
+                    padding: 14px 16px;
+                    margin-top: 6px;
+                    border: 2px solid var(--border-color);
+                    border-radius: 8px;
+                    box-sizing: border-box;
+                    transition: var(--transition);
+                    font-family: 'Vazirmatn', sans-serif;
+                    font-size: 15px;
+                    background: var(--white-color);
+                }
+                #arman-personnel-panel input:focus, 
+                #arman-personnel-panel textarea:focus,
+                #arman-personnel-panel select:focus {
+                    border-color: var(--secondary-color);
+                    box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.1);
+                    outline: none;
+                }
+                
+                #arman-personnel-panel .button,
+                #arman-personnel-panel input[type='submit'] {
+                    background: linear-gradient(135deg, var(--secondary-color) 0%, #2980b9 100%);
+                    color: var(--white-color);
+                    border: none;
+                    padding: 14px 28px;
+                    border-radius: 8px;
+                    cursor: pointer;
+                    font-weight: 600;
+                    transition: var(--transition);
+                    margin-top: 1rem;
+                    font-family: 'Vazirmatn', sans-serif;
+                    font-size: 15px;
+                    box-shadow: 0 4px 12px rgba(52, 152, 219, 0.3);
+                }
+                #arman-personnel-panel .button:hover,
+                #arman-personnel-panel input[type='submit']:hover {
+                    transform: translateY(-2px);
+                    box-shadow: 0 6px 16px rgba(52, 152, 219, 0.4);
+                }
+                #arman-personnel-panel .button:active {
+                    transform: translateY(0);
+                }
+
+                #arman-personnel-panel .notice {
+                    padding: 1.25rem;
+                    margin-bottom: 2rem;
+                    border-radius: 8px;
+                    border-right: 4px solid;
+                    font-weight: 500;
+                    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                }
+                #arman-personnel-panel .notice-success { 
+                    border-color: var(--success-color); 
+                    background: rgba(39, 174, 96, 0.1); 
+                    color: #155724;
+                }
+                #arman-personnel-panel .notice.error, 
+                #arman-personnel-panel p.error { 
+                    border-color: var(--accent-color); 
+                    background: rgba(231, 76, 60, 0.1); 
+                    color: #721c24; 
+                    padding: 1.25rem;
+                }
+
+                /* --- Tables --- */
+                #arman-personnel-panel .wp-list-table {
+                    border: none;
+                    box-shadow: var(--box-shadow);
+                    border-radius: var(--border-radius);
+                    overflow: hidden;
+                    background: var(--white-color);
+                    margin-top: 1.5rem;
+                }
+                #arman-personnel-panel .wp-list-table thead tr {
+                    background: linear-gradient(135deg, var(--primary-color) 0%, #34495e 100%);
+                    color: var(--white-color);
+                }
+                #arman-personnel-panel .wp-list-table th { 
+                    padding: 1.25rem; 
+                    text-align: right; 
+                    font-weight: 600;
+                    border-bottom: none;
+                }
+                #arman-personnel-panel .wp-list-table td {
+                    padding: 1.25rem;
+                    border-color: var(--border-color);
+                    vertical-align: middle;
+                }
+                #arman-personnel-panel .wp-list-table tbody tr:nth-child(even) { 
+                    background-color: rgba(52, 152, 219, 0.03); 
+                }
+                #arman-personnel-panel .wp-list-table tbody tr:hover { 
+                    background-color: rgba(52, 152, 219, 0.08); 
+                    transform: scale(1.002);
+                    transition: var(--transition);
+                }
+
+                /* --- Dashboard Layout & Nav --- */
+                 #arman-personnel-panel .crm-header {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    padding: 2rem;
+                    background: var(--white-color);
+                    border-radius: var(--border-radius);
+                    box-shadow: var(--box-shadow);
+                    margin-bottom: 2.5rem;
+                    border: 1px solid var(--border-color);
+                 }
+                 #arman-personnel-panel .crm-header h2 { 
+                    margin: 0; 
+                    font-size: 1.75rem;
+                }
+                #arman-personnel-panel .crm-header h2:after {
+                    display: none;
+                }
+                 #arman-personnel-panel .crm-nav { 
+                    display: flex;
+                    gap: 1rem;
+                    flex-wrap: wrap;
+                 }
+                 #arman-personnel-panel .crm-nav a { 
+                    padding: 10px 18px;
+                    border-radius: 8px;
+                    background: rgba(52, 152, 219, 0.1);
+                    color: var(--secondary-color);
+                    font-weight: 600;
+                    transition: var(--transition);
+                 }
+                 #arman-personnel-panel .crm-nav a:hover { 
+                    background: var(--secondary-color);
+                    color: white;
+                    text-decoration: none;
+                    transform: translateY(-2px);
+                 }
+                 #arman-personnel-panel .crm-nav a.logout { 
+                    background: rgba(231, 76, 60, 0.1);
+                    color: var(--accent-color);
+                 }
+                 #arman-personnel-panel .crm-nav a.logout:hover {
+                    background: var(--accent-color);
+                    color: white;
+                 }
+
+                /* Details page layout */
+                .followup-details-grid {
+                    display: grid;
+                    grid-template-columns: 1fr 1fr;
+                    gap: 2.5rem;
+                    margin-top: 2rem;
+                }
+
+                .card {
+                    background: var(--white-color);
+                    border-radius: var(--border-radius);
+                    padding: 2rem;
+                    box-shadow: var(--box-shadow);
+                    border: 1px solid var(--border-color);
+                    margin-bottom: 2rem;
+                }
+
+                .stats-grid {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                    gap: 1.5rem;
+                    margin: 2rem 0;
+                }
+
+                .stat-card {
+                    background: linear-gradient(135deg, var(--white-color) 0%, #f8f9fa 100%);
+                    padding: 1.5rem;
+                    border-radius: var(--border-radius);
+                    text-align: center;
+                    box-shadow: var(--box-shadow);
+                    border: 1px solid var(--border-color);
+                    transition: var(--transition);
+                }
+
+                .stat-card:hover {
+                    transform: translateY(-5px);
+                    box-shadow: 0 12px 30px rgba(0,0,0,0.15);
+                }
+
+                .stat-number {
+                    font-size: 2.5rem;
+                    font-weight: 700;
+                    color: var(--secondary-color);
+                    margin-bottom: 0.5rem;
+                }
+
+                .stat-label {
+                    color: var(--light-text);
+                    font-weight: 600;
+                    font-size: 0.9rem;
+                }
+
+                /* Product fields styling */
+                #product-fields input,
+                #edit-product-fields input {
+                    margin-bottom: 0.75rem;
+                }
+
+                .product-input-row {
+                    display: flex;
+                    gap: 1rem;
+                    margin-bottom: 1rem;
+                    align-items: center;
+                }
+
+                .product-input-row input {
+                    flex: 1;
+                    margin-bottom: 0;
+                }
+
+                /* Responsive Design */
+                @media (max-width: 1024px) {
+                    #arman-personnel-panel { padding: 1.5rem; }
+                }
+
+                @media (max-width: 768px) {
+                    #arman-personnel-panel { padding: 1rem; }
+                    .followup-details-grid { grid-template-columns: 1fr; }
+                    #arman-personnel-panel .crm-header { 
+                        flex-direction: column; 
+                        align-items: flex-start; 
+                        gap: 1.5rem;
+                    }
+                    #arman-personnel-panel .crm-nav { 
+                        width: 100%;
+                        justify-content: center;
+                    }
+                    #arman-personnel-panel .crm-nav a { 
+                        flex: 1;
+                        text-align: center;
+                        min-width: 120px;
+                    }
+                    .stats-grid {
+                        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+                    }
+                }
+
+                @media (max-width: 480px) {
+                    #arman-personnel-panel form {
+                        padding: 1.5rem;
+                    }
+                    #arman-crm-login-form {
+                        padding: 2rem;
+                    }
+                    .product-input-row {
+                        flex-direction: column;
+                        gap: 0.5rem;
+                    }
+                }
+
+                /* UI element enhancements */
+                .badge {
+                    display: inline-block;
+                    padding: 4px 12px;
+                    border-radius: 20px;
+                    font-size: 0.8rem;
+                    font-weight: 600;
+                    text-transform: uppercase;
+                }
+
+                .badge-success { background: var(--success-color); color: white; }
+                .badge-warning { background: var(--warning-color); color: white; }
+                .badge-primary { background: var(--primary-color); color: white; }
+                .badge-secondary { background: var(--secondary-color); color: white; }
+
+                /* Loading animation */
+                @keyframes fadeIn {
+                    from { opacity: 0; transform: translateY(20px); }
+                    to { opacity: 1; transform: translateY(0); }
+                }
+
+                #arman-personnel-panel > * {
+                    animation: fadeIn 0.5s ease-out;
+                }
+            ";
+            wp_add_inline_style( 'wp-block-library', $css );
+            wp_enqueue_script('jquery-ui-autocomplete');
+        }
+    }
+
+    /**
+     * Start PHP session
+     */
+    public function start_session() {
+        if ( ! session_id() ) {
+            session_start();
+        }
+    }
+
+    /**
+     * Handle personnel logout
+     */
+    public function handle_logout() {
+        if ( isset( $_GET['crm_action'] ) && $_GET['crm_action'] == 'logout' ) {
+            unset( $_SESSION['arman_personnel_id'] );
+            wp_redirect( remove_query_arg( 'crm_action' ) );
+            exit;
+        }
+    }
+
+    /**
+     * Render the personnel panel using a shortcode
+     */
+    public function render_personnel_panel() {
+        ob_start();
+
+        if ( ! isset( $_SESSION['arman_personnel_id'] ) ) {
+            $this->render_login_form();
+        } else {
+            $this->render_personnel_dashboard();
+        }
+
+        return ob_get_clean();
+    }
+
+    /**
+     * Render the login form for personnel with new styling
+     */
+    public function render_login_form() {
+        global $wpdb;
+        $error_message = '';
+        
+        if ( isset( $_POST['arman_login_nonce'] ) && wp_verify_nonce( $_POST['arman_login_nonce'], 'arman_login_action' ) ) {
+            $username = sanitize_text_field( $_POST['username'] );
+            $password = $_POST['password'];
+            
+            $table_personnel = $wpdb->prefix . 'arman_personnel';
+            $personnel = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM $table_personnel WHERE username = %s", $username ) );
+
+            if ( $personnel && wp_check_password( $password, $personnel->password ) ) {
+                $_SESSION['arman_personnel_id'] = $personnel->id;
+                echo "<meta http-equiv='refresh' content='0'>";
+                return;
+            } else {
+                $error_message = '<div class="notice error"><p>نام کاربری یا رمز عبور اشتباه است.</p></div>';
+            }
+        }
+        
+        ?>
+        <div id="arman-crm-login-container">
+            <div id="arman-crm-login-form">
+                <h2>ورود به سیستم CRM</h2>
+                <p style="color: var(--light-text); margin-bottom: 2rem;">سیستم مدیریت ارتباط با مشتریان آرمان پارت</p>
+                <?php echo $error_message; ?>
+                <form method="post" action="">
+                    <?php wp_nonce_field( 'arman_login_action', 'arman_login_nonce' ); ?>
+                    <div class="form-group">
+                        <label for="username">نام کاربری</label>
+                        <input type="text" name="username" id="username" required placeholder="نام کاربری خود را وارد کنید">
+                    </div>
+                    <div class="form-group">
+                        <label for="password">رمز عبور</label>
+                        <input type="password" name="password" id="password" required placeholder="رمز عبور خود را وارد کنید">
+                    </div>
+                    <div class="form-group">
+                        <input type="submit" value="ورود به سیستم" style="width: 100%;">
+                    </div>
+                </form>
+            </div>
+        </div>
+        <?php
+    }
+
+    /**
+     * Render the main dashboard for logged-in personnel with new layout
+     */
+    public function render_personnel_dashboard() {
+        $current_page = isset( $_GET['crm_page'] ) ? sanitize_key( $_GET['crm_page'] ) : 'dashboard';
+        $page_title = 'داشبورد'; // Default title
+        $pages = [
+            'dashboard' => 'داشبورد',
+            'add_call' => 'ثبت پرونده جدید',
+            'my_followups' => 'پیگیری های من',
+            'archived_paid' => 'پرونده های واریز شده',
+            'archived_finished' => 'پرونده های خاتمه یافته',
+            'customers' => 'مشتریان',
+            'products' => 'کالاها',
+            'reports' => 'گزارشات'
+        ];
+        if (isset($pages[$current_page])) {
+            $page_title = $pages[$current_page];
+        }
+        if (isset($_GET['followup_id'])) {
+            $page_title = 'جزئیات پرونده';
+        }
+        ?>
+        <div id="arman-personnel-panel">
+            <header class="crm-header">
+                <div>
+                    <h2><?php echo esc_html($page_title); ?></h2>
+                    <p style="margin: 0; color: var(--light-text); font-size: 0.95rem;">سیستم مدیریت ارتباط با مشتریان</p>
+                </div>
+                <nav class="crm-nav">
+                    <a href="?crm_page=dashboard" class="<?php echo $current_page == 'dashboard' ? 'active' : ''; ?>">📊 داشبورد</a>
+                    <a href="?crm_page=add_call" class="<?php echo $current_page == 'add_call' ? 'active' : ''; ?>">➕ ثبت پرونده</a>
+                    <a href="?crm_page=my_followups" class="<?php echo $current_page == 'my_followups' ? 'active' : ''; ?>">📞 پیگیری های فعال</a>
+                    <a href="?crm_page=customers" class="<?php echo $current_page == 'customers' ? 'active' : ''; ?>">👥 مشتریان</a>
+                    <a href="?crm_page=products" class="<?php echo $current_page == 'products' ? 'active' : ''; ?>">📦 کالاها</a>
+                    <a href="?crm_page=archived_paid" class="<?php echo $current_page == 'archived_paid' ? 'active' : ''; ?>">💰 بایگانی (واریز شده)</a>
+                    <a href="?crm_page=archived_finished" class="<?php echo $current_page == 'archived_finished' ? 'active' : ''; ?>">✅ بایگانی (خاتمه یافته)</a>
+                    <a href="?crm_action=logout" class="logout">🚪 خروج</a>
+                </nav>
+            </header>
+            
+            <main class="crm-main-content">
+                <?php
+                switch ($current_page) {
+                    case 'add_call':
+                        $this->render_add_call_page();
+                        break;
+                    case 'my_followups':
+                        $this->render_my_followups_page();
+                        break;
+                    case 'archived_paid':
+                        $this->render_archived_list_page('paid', 'پرونده های واریز شده');
+                        break;
+                    case 'archived_finished':
+                        $this->render_archived_list_page('finished', 'پرونده های خاتمه یافته');
+                        break;
+                    case 'customers':
+                        $this->render_customers_page();
+                        break;
+                    case 'products':
+                        $this->render_products_page();
+                        break;
+                    case 'reports':
+                        $this->render_personnel_reports_page();
+                        break;
+                    default:
+                        $this->render_dashboard_home();
+                        break;
+                }
+                ?>
+            </main>
+        </div>
+        <?php
+    }
+
+    /**
+     * Render the dashboard home with stats and quick actions
+     */
+    private function render_dashboard_home() {
+        global $wpdb;
+        $personnel_id = $_SESSION['arman_personnel_id'];
+        
+        $table_followups = $wpdb->prefix . 'arman_followups';
+        $table_customers = $wpdb->prefix . 'arman_customers';
+        $table_call_history = $wpdb->prefix . 'arman_call_history';
+        
+        // Get stats
+        $active_followups = $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM $table_followups WHERE personnel_id = %d AND final_status = 'follow_up'", 
+            $personnel_id
+        ));
+        
+        $total_calls = $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM $table_call_history WHERE personnel_id = %d", 
+            $personnel_id
+        ));
+        
+        $total_customers = $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(DISTINCT customer_id) FROM $table_followups WHERE personnel_id = %d", 
+            $personnel_id
+        ));
+        
+        $successful_orders = $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM $table_followups WHERE personnel_id = %d AND final_status = 'paid'", 
+            $personnel_id
+        ));
+        ?>
+        
+        <div class="card">
+            <h2>خلاصه عملکرد</h2>
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-number"><?php echo intval($active_followups); ?></div>
+                    <div class="stat-label">پرونده فعال</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number"><?php echo intval($total_calls); ?></div>
+                    <div class="stat-label">تماس ثبت شده</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number"><?php echo intval($total_customers); ?></div>
+                    <div class="stat-label">مشتری منحصر به فرد</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number"><?php echo intval($successful_orders); ?></div>
+                    <div class="stat-label">سفارش موفق</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="followup-details-grid">
+            <div class="card">
+                <h3>دسترسی سریع</h3>
+                <div style="display: flex; flex-direction: column; gap: 1rem;">
+                    <a href="?crm_page=add_call" class="button" style="text-align: center; display: block;">➕ ثبت پرونده جدید</a>
+                    <a href="?crm_page=my_followups" class="button" style="text-align: center; display: block;">📞 مدیریت پیگیری ها</a>
+                    <a href="?crm_page=customers" class="button" style="text-align: center; display: block;">👥 مشاهده مشتریان</a>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>آخرین فعالیت ها</h3>
+                <?php
+                $recent_followups = $wpdb->get_results($wpdb->prepare(
+                    "SELECT f.*, c.name as customer_name 
+                     FROM $table_followups f 
+                     JOIN $table_customers c ON f.customer_id = c.id 
+                     WHERE f.personnel_id = %d 
+                     ORDER BY f.updated_at DESC LIMIT 5",
+                    $personnel_id
+                ));
+                
+                if ($recent_followups) {
+                    echo '<div style="display: flex; flex-direction: column; gap: 1rem;">';
+                    foreach ($recent_followups as $followup) {
+                        $status_badge = $this->get_status_badge($followup->final_status);
+                        echo "<div style='display: flex; justify-content: space-between; align-items: center; padding: 0.75rem; background: rgba(52, 152, 219, 0.05); border-radius: 8px;'>
+                                <div>
+                                    <strong>{$followup->customer_name}</strong>
+                                    <div style='font-size: 0.85rem; color: var(--light-text);'>{$this->to_shamsi_date($followup->updated_at)}</div>
+                                </div>
+                                {$status_badge}
+                              </div>";
+                    }
+                    echo '</div>';
+                } else {
+                    echo '<p style="color: var(--light-text); text-align: center;">هنوز فعالیتی ثبت نشده است</p>';
+                }
+                ?>
+            </div>
+        </div>
+        <?php
+    }
+
+    /**
+     * Get status badge HTML
+     */
+    private function get_status_badge($status) {
+        $badges = [
+            'follow_up' => '<span class="badge badge-primary">در حال پیگیری</span>',
+            'paid' => '<span class="badge badge-success">واریز شده</span>',
+            'finished' => '<span class="badge badge-secondary">خاتمه یافته</span>'
+        ];
+        
+        return isset($badges[$status]) ? $badges[$status] : '<span class="badge">' . $status . '</span>';
+    }
+
+    /**
+     * Render and handle the "Add New Follow-up" page
+     */
+    public function render_add_call_page() {
+        global $wpdb;
+
+        // Handle form submission
+        if ( isset( $_POST['add_call_nonce'] ) && wp_verify_nonce( $_POST['add_call_nonce'], 'add_call_action' ) ) {
+            
+            $customer_name  = sanitize_text_field( $_POST['customer_name'] );
+            $customer_phone = sanitize_text_field( $_POST['customer_phone'] );
+            $customer_city  = sanitize_text_field( $_POST['customer_city'] );
+            $vehicle_model  = sanitize_text_field( $_POST['vehicle_model'] );
+            $is_colleague   = isset( $_POST['is_colleague'] ) ? 1 : 0;
+            
+            $call_duration  = intval( $_POST['call_duration'] );
+            $description    = sanitize_textarea_field( $_POST['description'] );
+            $initial_status = sanitize_text_field( $_POST['initial_status'] );
+            $products       = isset( $_POST['products'] ) ? array_map( 'sanitize_text_field', $_POST['products'] ) : [];
+
+            // Find or create customer
+            $table_customers = $wpdb->prefix . 'arman_customers';
+            $customer_id = $wpdb->get_var( $wpdb->prepare( "SELECT id FROM $table_customers WHERE phone = %s", $customer_phone ) );
+
+            if ( ! $customer_id ) {
+                $wpdb->insert($table_customers, ['name' => $customer_name, 'phone' => $customer_phone, 'city' => $customer_city, 'vehicle_model' => $vehicle_model, 'is_colleague' => $is_colleague]);
+                $customer_id = $wpdb->insert_id;
+            }
+
+            // Insert the main follow-up record
+            $table_followups = $wpdb->prefix . 'arman_followups';
+            $wpdb->insert($table_followups, ['customer_id' => $customer_id, 'personnel_id' => $_SESSION['arman_personnel_id'], 'initial_status' => $initial_status]);
+            $followup_id = $wpdb->insert_id;
+
+            // Insert the first call into history
+            if ($followup_id) {
+                $table_call_history = $wpdb->prefix . 'arman_call_history';
+                $wpdb->insert($table_call_history, ['followup_id' => $followup_id, 'personnel_id' => $_SESSION['arman_personnel_id'], 'call_duration' => $call_duration, 'description' => $description]);
+            }
+            
+            // Insert follow-up products
+            if ( $followup_id && ! empty( $products ) ) {
+                $table_followup_products = $wpdb->prefix . 'arman_followup_products';
+                foreach ( $products as $product_name ) {
+                    if ( ! empty( $product_name ) ) {
+                        $wpdb->insert($table_followup_products, ['followup_id' => $followup_id, 'product_name' => $product_name]);
+                    }
+                }
+            }
+            
+            echo '<div class="notice notice-success"><p>پرونده پیگیری با موفقیت ایجاد شد.</p></div>';
+        }
+        ?>
+        <div class="card">
+            <form method="post" action="">
+                <?php wp_nonce_field( 'add_call_action', 'add_call_nonce' ); ?>
+
+                <div class="followup-details-grid">
+                    <div>
+                        <h3>📋 اطلاعات مشتری</h3>
+                        <div class="form-group">
+                            <label for="customer_name">نام و نام خانوادگی</label>
+                            <input type="text" id="customer_name" name="customer_name" required placeholder="نام کامل مشتری">
+                        </div>
+                        <div class="form-group">
+                            <label for="customer_phone">شماره تماس</label>
+                            <input type="tel" id="customer_phone" name="customer_phone" required placeholder="شماره تماس مشتری">
+                        </div>
+                        <div class="form-group">
+                            <label for="customer_city">شهر</label>
+                            <input type="text" id="customer_city" name="customer_city" placeholder="شهر محل سکونت">
+                        </div>
+                        <div class="form-group">
+                            <label for="vehicle_model">مدل ماشین</label>
+                            <input type="text" id="vehicle_model" name="vehicle_model" placeholder="مدل خودروی مشتری">
+                        </div>
+                        <div class="form-group">
+                            <label style="display: flex; align-items: center; gap: 8px;">
+                                <input type="checkbox" id="is_colleague" name="is_colleague" value="1">
+                                <span>همکار</span>
+                            </label>
+                        </div>
+                    </div>
+                    <div>
+                        <h3>📞 جزئیات تماس اولیه</h3>
+                        <div class="form-group">
+                            <label for="call_duration">مدت زمان تماس (دقیقه)</label>
+                            <input type="number" id="call_duration" name="call_duration" placeholder="مدت زمان مکالمه">
+                        </div>
+                        <div class="form-group">
+                            <label for="description">توضیحات تماس</label>
+                            <textarea id="description" name="description" rows="5" placeholder="خلاصه ای از محتوای مکالمه"></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label for="initial_status">دسته بندی اولیه</label>
+                            <select name="initial_status" id="initial_status">
+                                <option value="waiting_for_price">⏳ منتظر قیمت و استعلام کالا</option>
+                                <option value="waiting_for_customer">📞 منتظر خبر مشتری</option>
+                                <option value="customer_declined">❌ مشتری نخواست</option>
+                                <option value="order_placed">✅ ثبت سفارش</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                <h3>📦 کالاهای مورد استعلام</h3>
+                <div id="product-fields">
+                    <div class="form-group">
+                        <input type="text" name="products[]" placeholder="نام کالا ۱">
+                    </div>
+                </div>
+                <button type="button" id="add-product-btn" class="button">➕ افزودن کالای دیگر</button>
+
+                <div class="form-group">
+                    <?php submit_button( '💾 ایجاد پرونده پیگیری' ); ?>
+                </div>
+            </form>
+        </div>
+        <script>
+            jQuery(document).ready(function($) {
+                // Customer autocomplete
+                $("#customer_name").autocomplete({
+                    source: function(request, response) {
+                        $.getJSON("<?php echo admin_url('admin-ajax.php'); ?>", { action: 'arman_search_customers', term: request.term }, response);
+                    },
+                    minLength: 2,
+                    select: function(event, ui) {
+                        $("#customer_phone").val(ui.item.customer.phone);
+                        $("#customer_city").val(ui.item.customer.city);
+                        $("#vehicle_model").val(ui.item.customer.vehicle_model);
+                        if (ui.item.customer.is_colleague == 1) {
+                            $("#is_colleague").prop('checked', true);
+                        } else {
+                            $("#is_colleague").prop('checked', false);
+                        }
+                    }
+                });
+
+                // Product autocomplete
+                function initializeProductAutocomplete(element) {
+                    element.autocomplete({
+                         source: function(request, response) {
+                            $.getJSON("<?php echo admin_url('admin-ajax.php'); ?>", { action: 'arman_search_products', term: request.term }, response);
+                        },
+                        minLength: 1
+                    });
+                }
+
+                // Attach autocomplete to the initial product input
+                initializeProductAutocomplete($('input[name="products[]"]').first());
+
+                // Handle dynamically added product fields
+                $('#add-product-btn').on('click', function() {
+                    var container = $('#product-fields');
+                    var productCount = container.find('input').length + 1;
+                    var newField = $('<div class="form-group"><input type="text" name="products[]" placeholder="نام کالا ' + productCount + '"></div>');
+                    container.append(newField);
+                    initializeProductAutocomplete(newField.find('input')); // Initialize autocomplete for the new field
+                });
+            });
+        </script>
+        <?php
+    }
+
+    /**
+     * Render the "My Follow-ups" page, which now includes a list and a detail view.
+     */
+    public function render_my_followups_page() {
+        if ( isset( $_GET['followup_id'] ) ) {
+            $this->render_followup_details_page( intval( $_GET['followup_id'] ) );
+        } else {
+            $this->render_followups_list_page();
+        }
+    }
+
+    /**
+     * Renders the list of active follow-ups for the current personnel.
+     */
+    private function render_followups_list_page() {
+        global $wpdb;
+        $personnel_id = $_SESSION['arman_personnel_id'];
+        $table_followups = $wpdb->prefix . 'arman_followups';
+        $table_customers = $wpdb->prefix . 'arman_customers';
+
+        $followups = $wpdb->get_results( $wpdb->prepare(
+            "SELECT f.*, cust.name as customer_name, cust.phone as customer_phone
+            FROM $table_followups f JOIN $table_customers cust ON f.customer_id = cust.id
+            WHERE f.personnel_id = %d AND f.final_status = 'follow_up'
+            ORDER BY f.updated_at DESC", $personnel_id
+        ) );
+        ?>
+        <div class="card">
+            <h2>پرونده های در حال پیگیری</h2>
+            <?php if ( ! empty( $followups ) ) : ?>
+                <table class="wp-list-table widefat fixed striped">
+                    <thead>
+                        <tr>
+                            <th>مشتری</th><th>شماره تماس</th><th>تاریخ ایجاد</th><th>آخرین بروزرسانی</th><th>وضعیت اولیه</th><th>عملیات</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ( $followups as $followup ) : ?>
+                            <tr>
+                                <td><?php echo esc_html( $followup->customer_name ); ?></td>
+                                <td><?php echo esc_html( $followup->customer_phone ); ?></td>
+                                <td><?php echo esc_html( $this->to_shamsi_date($followup->created_at) ); ?></td>
+                                <td><?php echo esc_html( $this->to_shamsi_date($followup->updated_at) ); ?></td>
+                                <td><?php echo esc_html( $this->get_status_translate( $followup->initial_status ) ); ?></td>
+                                <td><a href="?crm_page=my_followups&followup_id=<?php echo $followup->id; ?>" class="button">👁️ مشاهده جزئیات</a></td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            <?php else : ?>
+                <div style="text-align: center; padding: 3rem; color: var(--light-text);">
+                    <p style="font-size: 1.2rem;">📭</p>
+                    <p>هیچ پرونده فعالی برای پیگیری یافت نشد.</p>
+                    <a href="?crm_page=add_call" class="button" style="margin-top: 1rem;">ثبت پرونده جدید</a>
+                </div>
+            <?php endif; ?>
+        </div>
+        <?php
+    }
+
+    /**
+     * Renders the detailed view for a single follow-up, including call history and forms.
+     */
+    private function render_followup_details_page( $followup_id ) {
+        global $wpdb;
+        $personnel_id = $_SESSION['arman_personnel_id'];
+
+        // Security check: ensure the current user owns this follow-up
+        $table_followups = $wpdb->prefix . 'arman_followups';
+        $followup = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM $table_followups WHERE id = %d AND personnel_id = %d", $followup_id, $personnel_id ) );
+        if ( ! $followup ) {
+            echo '<div class="notice error"><p>شما به این پرونده دسترسی ندارید یا این پرونده وجود ندارد.</p></div>';
+            return;
+        }
+
+        $table_call_history = $wpdb->prefix . 'arman_call_history';
+        $table_followup_products = $wpdb->prefix . 'arman_followup_products';
+
+        // Handle adding a new call to history
+        if ( isset( $_POST['add_history_nonce'] ) && wp_verify_nonce( $_POST['add_history_nonce'], 'add_history_action' ) ) {
+            $wpdb->insert( $table_call_history, [
+                'followup_id' => $followup_id,
+                'personnel_id' => $personnel_id,
+                'call_duration' => intval($_POST['call_duration']),
+                'description' => sanitize_textarea_field($_POST['description']),
+            ]);
+            echo '<div class="notice notice-success"><p>✅ تماس جدید به تاریخچه اضافه شد.</p></div>';
+        }
+
+        // Handle updating the main follow-up (status, products)
+        if ( isset( $_POST['update_followup_nonce'] ) && wp_verify_nonce( $_POST['update_followup_nonce'], 'update_followup_action' ) ) {
+            // Update status
+            $wpdb->update($table_followups, ['initial_status' => sanitize_text_field($_POST['initial_status']), 'final_status' => sanitize_text_field($_POST['final_status'])], ['id' => $followup_id]);
+
+            // Update products (delete all and re-insert)
+            $wpdb->delete( $table_followup_products, ['followup_id' => $followup_id] );
+            if ( ! empty( $_POST['products'] ) ) {
+                $products = $_POST['products'];
+                $prices = $_POST['prices'];
+                for ( $i = 0; $i < count($products); $i++ ) {
+                    if ( ! empty( $products[$i] ) ) {
+                        $wpdb->insert(
+                            $table_followup_products,
+                            [
+                                'followup_id' => $followup_id,
+                                'product_name' => sanitize_text_field( $products[$i] ),
+                                'price' => floatval( $prices[$i] )
+                            ]
+                        );
+                    }
+                }
+            }
+             echo '<div class="notice notice-success"><p>✅ پرونده با موفقیت به‌روزرسانی شد.</p></div>';
+             // Refresh followup data
+             $followup = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM $table_followups WHERE id = %d", $followup_id ) );
+        }
+        
+        $customer = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$wpdb->prefix}arman_customers WHERE id = %d", $followup->customer_id ) );
+        $call_history = $wpdb->get_results( $wpdb->prepare( "SELECT * FROM $table_call_history WHERE followup_id = %d ORDER BY created_at DESC", $followup_id ) );
+        $products = $wpdb->get_results( $wpdb->prepare( "SELECT * FROM $table_followup_products WHERE followup_id = %d", $followup_id ) );
+        ?>
+        
+        <div class="card">
+            <a href="?crm_page=my_followups" class="button" style="margin-bottom: 2rem; display: inline-flex; align-items: center; gap: 8px;">&rarr; بازگشت به لیست پرونده ها</a>
+            
+            <h3>📋 اطلاعات مشتری</h3>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 2rem;">
+                <div><strong>نام:</strong> <?php echo esc_html($customer->name); ?></div>
+                <div><strong>تلفن:</strong> <?php echo esc_html($customer->phone); ?></div>
+                <div><strong>شهر:</strong> <?php echo esc_html($customer->city); ?></div>
+                <div><strong>خودرو:</strong> <?php echo esc_html($customer->vehicle_model); ?></div>
+            </div>
+
+            <h3>📞 تاریخچه تماس ها</h3>
+            <?php if(!empty($call_history)): ?>
+                <table class="wp-list-table widefat fixed striped">
+                    <thead><tr><th>تاریخ</th><th>مدت زمان (دقیقه)</th><th>توضیحات</th></tr></thead>
+                    <tbody>
+                        <?php foreach($call_history as $call): ?>
+                        <tr>
+                            <td><?php echo esc_html($this->to_shamsi_date($call->created_at)); ?></td>
+                            <td><?php echo intval($call->call_duration); ?></td>
+                            <td><?php echo nl2br(esc_html($call->description)); ?></td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            <?php else: ?>
+                <div style="text-align: center; padding: 2rem; color: var(--light-text);">
+                    <p>📭 هیچ تماسی در تاریخچه ثبت نشده است.</p>
+                </div>
+            <?php endif; ?>
+        </div>
+
+        <div class="followup-details-grid">
+            <div class="card">
+                <h3>📞 افزودن تماس جدید</h3>
+                <form method="post">
+                    <?php wp_nonce_field( 'add_history_action', 'add_history_nonce' ); ?>
+                    <div class="form-group">
+                        <label>مدت زمان تماس (دقیقه)</label>
+                        <input type="number" name="call_duration" placeholder="مدت زمان مکالمه">
+                    </div>
+                    <div class="form-group">
+                        <label>توضیحات تماس</label>
+                        <textarea name="description" rows="5" placeholder="خلاصه ای از محتوای مکالمه"></textarea>
+                    </div>
+                    <div class="form-group">
+                        <?php submit_button('➕ افزودن تماس'); ?>
+                    </div>
+                </form>
+            </div>
+            <div class="card">
+                <h3>⚙️ ویرایش وضعیت پرونده</h3>
+                <form method="post">
+                    <?php wp_nonce_field( 'update_followup_action', 'update_followup_nonce' ); ?>
+                    <div class="form-group">
+                        <label>وضعیت اولیه</label>
+                        <select name="initial_status">
+                            <option value="waiting_for_price" <?php selected( $followup->initial_status, 'waiting_for_price' ); ?>>⏳ منتظر قیمت</option>
+                            <option value="waiting_for_customer" <?php selected( $followup->initial_status, 'waiting_for_customer' ); ?>>📞 منتظر خبر مشتری</option>
+                            <option value="customer_declined" <?php selected( $followup->initial_status, 'customer_declined' ); ?>>❌ مشتری نخواست</option>
+                            <option value="order_placed" <?php selected( $followup->initial_status, 'order_placed' ); ?>>✅ ثبت سفارش</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>وضعیت نهایی</label>
+                        <select name="final_status">
+                            <option value="follow_up" <?php selected( $followup->final_status, 'follow_up' ); ?>>🔄 در حال پیگیری</option>
+                            <option value="finished" <?php selected( $followup->final_status, 'finished' ); ?>>✅ خاتمه</option>
+                            <option value="paid" <?php selected( $followup->final_status, 'paid' ); ?>>💰 واریز شد</option>
+                        </select>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>📦 کالاهای مورد استعلام</label>
+                        <div id="edit-product-fields">
+                            <?php if(!empty($products)): foreach($products as $index => $product): ?>
+                                <div class="product-input-row">
+                                    <input type="text" name="products[]" value="<?php echo esc_attr($product->product_name); ?>" placeholder="نام کالا">
+                                    <input type="number" name="prices[]" value="<?php echo esc_attr($product->price); ?>" placeholder="قیمت (تومان)" style="width: 120px;">
+                                </div>
+                            <?php endforeach; endif; ?>
+                            <div class="product-input-row">
+                                <input type="text" name="products[]" placeholder="افزودن کالای جدید">
+                                <input type="number" name="prices[]" placeholder="قیمت (تومان)" style="width: 120px;">
+                            </div>
+                        </div>
+                         <button type="button" id="edit-add-product-btn" class="button">➕ افزودن فیلد کالا</button>
+                    </div>
+                    
+                    <div class="form-group">
+                        <?php submit_button('💾 ذخیره تغییرات'); ?>
+                    </div>
+                </form>
+            </div>
+        </div>
+        <script>
+            jQuery(document).ready(function($) {
+                // Product autocomplete function
+                function initializeProductAutocomplete(element) {
+                    element.autocomplete({
+                        source: function(request, response) {
+                            $.getJSON("<?php echo admin_url('admin-ajax.php'); ?>", { action: 'arman_search_products', term: request.term }, response);
+                        },
+                        minLength: 1
+                    });
+                }
+
+                // Attach autocomplete to existing product inputs
+                $('#edit-product-fields input[name="products[]"]').each(function() {
+                    initializeProductAutocomplete($(this));
+                });
+
+                // Handle dynamically added product fields
+                $('#edit-add-product-btn').on('click', function() {
+                    var container = $('#edit-product-fields');
+                    var newRow = $('<div class="product-input-row"></div>');
+                    var newProductInput = $('<input type="text" name="products[]" placeholder="نام کالا">');
+                    var newPriceInput = $('<input type="number" name="prices[]" placeholder="قیمت (تومان)" style="width: 120px;">');
+                    
+                    newRow.append(newProductInput).append(newPriceInput);
+                    container.append(newRow);
+                    
+                    initializeProductAutocomplete(newProductInput); // Initialize for the new field
+                });
+            });
+        </script>
+        <?php
+    }
+
+    /**
+     * Renders a list of archived follow-ups based on their final status ('paid' or 'finished').
+     */
+    private function render_archived_list_page( $status, $page_title ) {
+        global $wpdb;
+        $personnel_id = $_SESSION['arman_personnel_id'];
+        $table_followups = $wpdb->prefix . 'arman_followups';
+        $table_customers = $wpdb->prefix . 'arman_customers';
+
+        $followups = $wpdb->get_results( $wpdb->prepare(
+            "SELECT f.*, cust.name as customer_name, cust.phone as customer_phone
+            FROM $table_followups f JOIN $table_customers cust ON f.customer_id = cust.id
+            WHERE f.personnel_id = %d AND f.final_status = %s
+            ORDER BY f.updated_at DESC", $personnel_id, $status
+        ) );
+        ?>
+        <div class="card">
+            <h2><?php echo esc_html($page_title); ?></h2>
+            <?php if ( ! empty( $followups ) ) : ?>
+                <table class="wp-list-table widefat fixed striped">
+                    <thead>
+                        <tr>
+                            <th>مشتری</th><th>شماره تماس</th><th>تاریخ ایجاد</th><th>تاریخ بایگانی</th><th>وضعیت اولیه</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ( $followups as $followup ) : ?>
+                            <tr>
+                                <td><?php echo esc_html( $followup->customer_name ); ?></td>
+                                <td><?php echo esc_html( $followup->customer_phone ); ?></td>
+                                <td><?php echo esc_html( $this->to_shamsi_date($followup->created_at) ); ?></td>
+                                <td><?php echo esc_html( $this->to_shamsi_date($followup->updated_at) ); ?></td>
+                                <td><?php echo esc_html( $this->get_status_translate( $followup->initial_status ) ); ?></td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            <?php else : ?>
+                <div style="text-align: center; padding: 3rem; color: var(--light-text);">
+                    <p style="font-size: 1.2rem;">📭</p>
+                    <p>هیچ پرونده بایگانی شده ای در این دسته یافت نشد.</p>
+                </div>
+            <?php endif; ?>
+        </div>
+        <?php
+    }
+
+    /**
+     * Converts a Gregorian date string to a formatted Shamsi date string.
+     */
+    private function to_shamsi_date( $gregorian_date_str ) {
+        if ( empty($gregorian_date_str) || $gregorian_date_str === '0000-00-00 00:00:00' ) {
+            return '';
+        }
+        $timestamp = strtotime($gregorian_date_str);
+        $g_year = date('Y', $timestamp);
+        $g_month = date('m', $timestamp);
+        $g_day = date('d', $timestamp);
+        
+        list($j_year, $j_month, $j_day) = $this->gregorian_to_jalali($g_year, $g_month, $g_day);
+
+        return sprintf('%04d/%02d/%02d', $j_year, $j_month, $j_day);
+    }
+
+    /**
+     * Converts a Gregorian date to a Jalali (Shamsi) date.
+     * Translated from the Lua script found on MTA Wiki.
+     */
+    private function gregorian_to_jalali($gy, $gm, $gd) {
+        $g_d_m = array(0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334);
+        $jy = ($gy <= 1600) ? 0 : 979;
+        $gy -= ($gy <= 1600) ? 621 : 1600;
+        $gy2 = ($gm > 2) ? ($gy + 1) : $gy;
+        $days = (365 * $gy) + ((int)(($gy2 + 3) / 4)) - ((int)(($gy2 + 99) / 100)) + ((int)(($gy2 + 399) / 400)) - 80 + $gd + $g_d_m[$gm - 1];
+        $jy += 33 * ((int)($days / 12053));
+        $days %= 12053;
+        $jy += 4 * ((int)($days / 1461));
+        $days %= 1461;
+        $jy += (int)(($days - 1) / 365);
+        if ($days > 365) $days = ($days - 1) % 365;
+        $jm = ($days < 186) ? 1 + (int)($days / 31) : 7 + (int)(($days - 186) / 30);
+        $jd = 1 + (($days < 186) ? ($days % 31) : (($days - 186) % 30));
+        return array($jy, $jm, $jd);
+    }
+
+    /**
+     * Helper function to translate status keys to Persian
+     */
+    public function get_status_translate( $status ) {
+        $translations = [
+            'waiting_for_price'    => 'منتظر قیمت',
+            'waiting_for_customer' => 'منتظر خبر مشتری',
+            'customer_declined'    => 'مشتری نخواست',
+            'order_placed'         => 'ثبت سفارش',
+            'follow_up'            => 'پیگیری',
+            'finished'             => 'خاتمه',
+            'paid'                 => 'واریز شد',
+        ];
+        return isset( $translations[$status] ) ? $translations[$status] : $status;
+    }
+
+    /**
+     * Render the Customers page for personnel
+     */
+    public function render_customers_page() {
+        global $wpdb;
+        $table_customers = $wpdb->prefix . 'arman_customers';
+        $table_followups = $wpdb->prefix . 'arman_followups';
+        $table_followup_products = $wpdb->prefix . 'arman_followup_products';
+    
+        $customers = $wpdb->get_results(
+            "SELECT 
+                cust.*,
+                COUNT(f.id) as total_followups,
+                SUM(CASE WHEN f.final_status = 'paid' THEN p.total_price ELSE 0 END) as total_spent
+            FROM $table_customers cust
+            LEFT JOIN $table_followups f ON cust.id = f.customer_id
+            LEFT JOIN (
+                SELECT followup_id, SUM(price) as total_price
+                FROM $table_followup_products
+                GROUP BY followup_id
+            ) p ON f.id = p.followup_id
+            GROUP BY cust.id
+            ORDER BY cust.name ASC"
+        );
+        ?>
+        <div class="card">
+            <h2>👥 مدیریت مشتریان</h2>
+            <?php if ( ! empty( $customers ) ) : ?>
+                <table class="wp-list-table widefat fixed striped">
+                    <thead>
+                        <tr>
+                            <th>نام</th><th>شماره تماس</th><th>شهر</th><th>مدل ماشین</th><th>تعداد پرونده</th><th>جمع خرید (تومان)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ( $customers as $customer ) : ?>
+                            <tr>
+                                <td><?php echo esc_html( $customer->name ); ?></td>
+                                <td><?php echo esc_html( $customer->phone ); ?></td>
+                                <td><?php echo esc_html( $customer->city ); ?></td>
+                                <td><?php echo esc_html( $customer->vehicle_model ); ?></td>
+                                <td><?php echo intval( $customer->total_followups ); ?></td>
+                                <td><?php echo number_format( floatval( $customer->total_spent ), 0 ); ?></td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            <?php else : ?>
+                <div style="text-align: center; padding: 3rem; color: var(--light-text);">
+                    <p style="font-size: 1.2rem;">📭</p>
+                    <p>هیچ مشتری یافت نشد.</p>
+                </div>
+            <?php endif; ?>
+        </div>
+        <?php
+    }
+
+    /**
+     * Render the Products page for personnel
+     */
+    public function render_products_page() {
+        global $wpdb;
+        $table_products = $wpdb->prefix . 'arman_followup_products';
+    
+        $products = $wpdb->get_results(
+            "SELECT DISTINCT product_name, MAX(price) as last_price, COUNT(id) as times_inquired
+            FROM $table_products
+            GROUP BY product_name
+            ORDER BY product_name ASC"
+        );
+        ?>
+        <div class="card">
+            <h2>📦 مدیریت کالاها</h2>
+            <?php if ( ! empty( $products ) ) : ?>
+                <table class="wp-list-table widefat fixed striped">
+                    <thead>
+                        <tr>
+                            <th>نام کالا</th><th>آخرین قیمت ثبت شده (تومان)</th><th>تعداد استعلام</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ( $products as $product ) : ?>
+                            <tr>
+                                <td><?php echo esc_html( $product->product_name ); ?></td>
+                                <td><?php echo number_format( floatval( $product->last_price ), 0 ); ?></td>
+                                <td><?php echo intval( $product->times_inquired ); ?></td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            <?php else : ?>
+                <div style="text-align: center; padding: 3rem; color: var(--light-text);">
+                    <p style="font-size: 1.2rem;">📭</p>
+                    <p>هیچ کالایی یافت نشد.</p>
+                </div>
+            <?php endif; ?>
+        </div>
+        <?php
+    }
+    
+    /**
+     * Render the Reports page for personnel
+     */
+    public function render_personnel_reports_page() {
+        global $wpdb;
+        $personnel_id = $_SESSION['arman_personnel_id'];
+        $table_followups = $wpdb->prefix . 'arman_followups';
+        
+        $initial_status_counts = $wpdb->get_results($wpdb->prepare("SELECT initial_status, COUNT(*) as count FROM $table_followups WHERE personnel_id = %d GROUP BY initial_status", $personnel_id), OBJECT_K);
+        $final_status_counts = $wpdb->get_results($wpdb->prepare("SELECT final_status, COUNT(*) as count FROM $table_followups WHERE personnel_id = %d GROUP BY final_status", $personnel_id), OBJECT_K);
+        ?>
+
+        <div class="card">
+            <h2>📊 گزارشات عملکرد</h2>
+            <div class="followup-details-grid">
+                <div class="card">
+                    <h3>وضعیت اولیه پرونده ها</h3>
+                    <table class="wp-list-table widefat fixed striped">
+                        <thead><tr><th>وضعیت</th><th>تعداد</th></tr></thead>
+                        <tbody>
+                            <?php foreach (['waiting_for_price', 'waiting_for_customer', 'customer_declined', 'order_placed'] as $status) : ?>
+                            <tr>
+                                <td><?php echo $this->get_status_translate($status); ?></td>
+                                <td><?php echo isset($initial_status_counts[$status]) ? intval($initial_status_counts[$status]->count) : 0; ?></td>
+                            </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+                 <div class="card">
+                    <h3>وضعیت نهایی پرونده ها</h3>
+                    <table class="wp-list-table widefat fixed striped">
+                        <thead><tr><th>وضعیت</th><th>تعداد</th></tr></thead>
+                        <tbody>
+                            <?php foreach (['follow_up', 'finished', 'paid'] as $status) : ?>
+                            <tr>
+                                <td><?php echo $this->get_status_translate($status); ?></td>
+                                <td><?php echo isset($final_status_counts[$status]) ? intval($final_status_counts[$status]->count) : 0; ?></td>
+                            </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        <?php
+    }
+
+    /**
+     * Add admin menu pages
+     */
+    public function add_admin_menu() {
+        add_menu_page(
+            __( 'Arman Part CRM', 'arman-part-crm' ),
+            __( 'CRM آرمان پارت', 'arman-part-crm' ),
+            'manage_options',
+            'arman-part-crm',
+            array( $this, 'render_personnel_page' ),
+            'dashicons-groups',
+            6
+        );
+
+        add_submenu_page(
+            'arman-part-crm',
+            __( 'Personnel Management', 'arman-part-crm' ),
+            __( 'مدیریت پرسنل', 'arman-part-crm' ),
+            'manage_options',
+            'arman-part-crm-personnel',
+            array( $this, 'render_personnel_page' )
+        );
+
+        add_submenu_page(
+            'arman-part-crm',
+            __( 'Reports', 'arman-part-crm' ),
+            __( 'گزارشات', 'arman-part-crm' ),
+            'manage_options',
+            'arman-part-crm-reports',
+            array( $this, 'render_reports_page' )
+        );
+    }
+
+    /**
+     * Render the Personnel Management page
+     */
+    public function render_personnel_page() {
+        global $wpdb;
+        $table_personnel = $wpdb->prefix . 'arman_personnel';
+
+        // Handle form submission for adding new personnel
+        if ( isset( $_POST['add_personnel_nonce'] ) && wp_verify_nonce( $_POST['add_personnel_nonce'], 'add_personnel_action' ) ) {
+            $username = sanitize_text_field( $_POST['username'] );
+            $password = wp_hash_password( $_POST['password'] );
+            $display_name = sanitize_text_field( $_POST['display_name'] );
+
+            $existing_user = $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $table_personnel WHERE username = %s", $username ) );
+
+            if ( $existing_user == 0 && ! empty( $username ) && ! empty( $_POST['password'] ) && ! empty( $display_name ) ) {
+                $wpdb->insert(
+                    $table_personnel,
+                    array(
+                        'username' => $username,
+                        'password' => $password,
+                        'display_name' => $display_name,
+                    ),
+                    array( '%s', '%s', '%s' )
+                );
+                echo '<div class="notice notice-success"><p>✅ پرسنل جدید با موفقیت اضافه شد.</p></div>';
+            } else {
+                echo '<div class="notice error"><p>❌ نام کاربری از قبل وجود دارد یا فیلدها خالی هستند.</p></div>';
+            }
+        }
+        
+        // Handle deletion of a personnel
+        if ( isset( $_GET['action'] ) && $_GET['action'] == 'delete' && isset( $_GET['personnel_id'] ) ) {
+            $personnel_id = intval( $_GET['personnel_id'] );
+            $wpdb->delete( $table_personnel, array( 'id' => $personnel_id ), array( '%d' ) );
+            echo '<div class="notice notice-success"><p>✅ پرسنل با موفقیت حذف شد.</p></div>';
+        }
+
+        // Fetch all personnel from the database
+        $personnel_list = $wpdb->get_results( "SELECT id, username, display_name FROM $table_personnel" );
+        ?>
+        <div class="wrap">
+            <h1><?php _e( 'مدیریت پرسنل', 'arman-part-crm' ); ?></h1>
+            
+            <div id="col-container">
+                <div id="col-right">
+                    <div class="col-wrap">
+                        <div class="card">
+                            <h2>لیست پرسنل</h2>
+                            <table class="wp-list-table widefat fixed striped">
+                                <thead>
+                                    <tr>
+                                        <th scope="col">نام نمایشی</th>
+                                        <th scope="col">نام کاربری</th>
+                                        <th scope="col">عملیات</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <?php if ( ! empty( $personnel_list ) ) : ?>
+                                        <?php foreach ( $personnel_list as $personnel ) : ?>
+                                            <tr>
+                                                <td><?php echo esc_html( $personnel->display_name ); ?></td>
+                                                <td><?php echo esc_html( $personnel->username ); ?></td>
+                                                <td><a href="?page=arman-part-crm-personnel&action=delete&personnel_id=<?php echo $personnel->id; ?>" class="button button-danger" onclick="return confirm('آیا از حذف این پرسنل مطمئن هستید؟')">🗑️ حذف</a></td>
+                                            </tr>
+                                        <?php endforeach; ?>
+                                    <?php else : ?>
+                                        <tr>
+                                            <td colspan="3" style="text-align: center; color: var(--light-text);">📭 هیچ پرسنلی یافت نشد.</td>
+                                        </tr>
+                                    <?php endif; ?>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+                <div id="col-left">
+                    <div class="col-wrap">
+                        <div class="card">
+                            <h2>👤 افزودن پرسنل جدید</h2>
+                            <form method="post" action="">
+                                <?php wp_nonce_field( 'add_personnel_action', 'add_personnel_nonce' ); ?>
+                                <div class="form-group">
+                                    <label for="display_name">نام نمایشی</label>
+                                    <input type="text" name="display_name" id="display_name" required placeholder="نام کامل پرسنل">
+                                </div>
+                                <div class="form-group">
+                                    <label for="username">نام کاربری</label>
+                                    <input type="text" name="username" id="username" required placeholder="نام کاربری برای ورود">
+                                </div>
+                                <div class="form-group">
+                                    <label for="password">رمز عبور</label>
+                                    <input type="password" name="password" id="password" required placeholder="رمز عبور قوی">
+                                </div>
+                                <?php submit_button( '➕ افزودن پرسنل' ); ?>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <?php
+    }
+
+    /**
+     * Render the Reports page
+     */
+    public function render_reports_page() {
+        global $wpdb;
+        $table_personnel = $wpdb->prefix . 'arman_personnel';
+        $table_followups = $wpdb->prefix . 'arman_followups';
+        $table_customers = $wpdb->prefix . 'arman_customers';
+        $table_followup_products = $wpdb->prefix . 'arman_followup_products';
+        $table_call_history = $wpdb->prefix . 'arman_call_history';
+
+        // Report 1: Personnel Performance
+        $personnel_performance = $wpdb->get_results("
+            SELECT 
+                p.display_name,
+                COUNT(DISTINCT f.id) as total_followups,
+                (SELECT SUM(ch.call_duration) FROM {$table_call_history} ch WHERE ch.personnel_id = p.id) as total_duration,
+                SUM(CASE WHEN f.final_status = 'paid' THEN 1 ELSE 0 END) as successful_orders
+            FROM {$table_personnel} p
+            LEFT JOIN {$table_followups} f ON p.id = f.personnel_id
+            GROUP BY p.id
+        ");
+
+        // Report 2: Sales by City
+        $sales_by_city = $wpdb->get_results("
+            SELECT cust.city, COUNT(DISTINCT f.id) as total_orders, SUM(p.price) as total_revenue
+            FROM {$table_followups} f
+            JOIN {$table_customers} cust ON f.customer_id = cust.id
+            JOIN {$table_followup_products} p ON f.id = p.followup_id
+            WHERE f.final_status = 'paid' AND cust.city != ''
+            GROUP BY cust.city
+        ");
+
+        // Report 3: Sales by Vehicle Model
+        $sales_by_vehicle = $wpdb->get_results("
+            SELECT cust.vehicle_model, COUNT(DISTINCT f.id) as total_orders, SUM(p.price) as total_revenue
+            FROM {$table_followups} f
+            JOIN {$table_customers} cust ON f.customer_id = cust.id
+            JOIN {$table_followup_products} p ON f.id = p.followup_id
+            WHERE f.final_status = 'paid' AND cust.vehicle_model != ''
+            GROUP BY cust.vehicle_model ORDER BY total_revenue DESC
+        ");
+
+        // Report 4: Top Selling Products
+        $top_products = $wpdb->get_results("
+            SELECT p.product_name, COUNT(p.id) as total_sales, SUM(p.price) as total_revenue
+            FROM {$table_followup_products} p
+            JOIN {$table_followups} f ON p.followup_id = f.id
+            WHERE f.final_status = 'paid' AND p.price > 0
+            GROUP BY p.product_name ORDER BY total_sales DESC
+        ");
+
+        // Report 5: Top Customers
+        $top_customers = $wpdb->get_results("
+            SELECT cust.name, cust.phone, COUNT(DISTINCT f.id) as total_orders, SUM(p.price) as total_spent
+            FROM {$table_customers} cust
+            JOIN {$table_followups} f ON cust.id = f.customer_id
+            JOIN {$table_followup_products} p ON f.id = p.followup_id
+            WHERE f.final_status = 'paid'
+            GROUP BY cust.id ORDER BY total_spent DESC
+        ");
+
+        ?>
+        <div class="wrap">
+            <h1><?php _e( '📊 گزارشات کامل مدیر', 'arman-part-crm' ); ?></h1>
+
+            <div class="card">
+                <h2>عملکرد پرسنل <a href="?page=arman-part-crm-reports&download_csv=personnel_performance" class="page-title-action">📥 خروجی CSV</a></h2>
+                <table class="wp-list-table widefat fixed striped">
+                    <thead><tr><th>پرسنل</th><th>تعداد کل پرونده ها</th><th>مجموع دقایق صحبت</th><th>سفارشات موفق</th></tr></thead>
+                    <tbody>
+                        <?php foreach($personnel_performance as $row): ?>
+                        <tr>
+                            <td><?php echo esc_html($row->display_name); ?></td>
+                            <td><?php echo intval($row->total_followups); ?></td>
+                            <td><?php echo intval($row->total_duration); ?></td>
+                            <td><?php echo intval($row->successful_orders); ?></td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="card" style="margin-top: 2rem;">
+                <h2>فروش بر اساس شهر <a href="?page=arman-part-crm-reports&download_csv=sales_by_city" class="page-title-action">📥 خروجی CSV</a></h2>
+                <table class="wp-list-table widefat fixed striped">
+                    <thead><tr><th>شهر</th><th>تعداد سفارشات</th><th>درآمد (تومان)</th></tr></thead>
+                    <tbody>
+                         <?php foreach($sales_by_city as $row): ?>
+                        <tr>
+                            <td><?php echo esc_html($row->city); ?></td>
+                            <td><?php echo intval($row->total_orders); ?></td>
+                            <td><?php echo number_format(floatval($row->total_revenue), 0); ?></td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+            
+            <div class="card" style="margin-top: 2rem;">
+                <h2>فروش بر اساس مدل ماشین <a href="?page=arman-part-crm-reports&download_csv=sales_by_vehicle" class="page-title-action">📥 خروجی CSV</a></h2>
+                <table class="wp-list-table widefat fixed striped">
+                    <thead><tr><th>مدل ماشین</th><th>تعداد سفارشات</th><th>درآمد (تومان)</th></tr></thead>
+                    <tbody>
+                         <?php foreach($sales_by_vehicle as $row): ?>
+                        <tr>
+                            <td><?php echo esc_html($row->vehicle_model); ?></td>
+                            <td><?php echo intval($row->total_orders); ?></td>
+                            <td><?php echo number_format(floatval($row->total_revenue), 0); ?></td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="card" style="margin-top: 2rem;">
+                <h2>کالاهای پرفروش <a href="?page=arman-part-crm-reports&download_csv=top_products" class="page-title-action">📥 خروجی CSV</a></h2>
+                <table class="wp-list-table widefat fixed striped">
+                    <thead><tr><th>نام کالا</th><th>تعداد فروش</th><th>درآمد (تومان)</th></tr></thead>
+                    <tbody>
+                         <?php foreach($top_products as $row): ?>
+                        <tr>
+                            <td><?php echo esc_html($row->product_name); ?></td>
+                            <td><?php echo intval($row->total_sales); ?></td>
+                            <td><?php echo number_format(floatval($row->total_revenue), 0); ?></td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="card" style="margin-top: 2rem;">
+                <h2>مشتریان برتر <a href="?page=arman-part-crm-reports&download_csv=top_customers" class="page-title-action">📥 خروجی CSV</a></h2>
+                <table class="wp-list-table widefat fixed striped">
+                    <thead><tr><th>مشتری</th><th>شماره تماس</th><th>تعداد سفارشات</th><th>مجموع خرید (تومان)</th></tr></thead>
+                    <tbody>
+                         <?php foreach($top_customers as $row): ?>
+                        <tr>
+                            <td><?php echo esc_html($row->name); ?></td>
+                            <td><?php echo esc_html($row->phone); ?></td>
+                            <td><?php echo intval($row->total_orders); ?></td>
+                            <td><?php echo number_format(floatval($row->total_spent), 0); ?></td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        <?php
+    }
+
+    /**
+     * Handle CSV Export for Admin Reports
+     */
+    public function handle_csv_export() {
+        if ( !isset($_GET['download_csv']) || !current_user_can('manage_options') ) return;
+        
+        global $wpdb;
+        $report_type = sanitize_key($_GET['download_csv']);
+        $filename = "arman_crm_{$report_type}_" . date('Y-m-d') . ".csv";
+
+        header('Content-Type: text/csv');
+        header('Content-Disposition: attachment; filename="' . $filename . '";');
+        
+        $output = fopen('php://output', 'w');
+        // Add UTF-8 BOM to fix encoding issues in Excel
+        fputs($output, "\xEF\xBB\xBF");
+
+        switch ($report_type) {
+            case 'personnel_performance':
+                fputcsv($output, ['پرسنل', 'تعداد کل پیگیری ها', 'مجموع دقایق صحبت', 'سفارشات موفق']);
+                $data = $wpdb->get_results("SELECT p.display_name, COUNT(DISTINCT f.id) as total_followups, (SELECT SUM(ch.call_duration) FROM {$wpdb->prefix}arman_call_history ch WHERE ch.personnel_id = p.id) as total_duration, SUM(CASE WHEN f.final_status = 'paid' THEN 1 ELSE 0 END) as successful_orders FROM {$wpdb->prefix}arman_personnel p LEFT JOIN {$wpdb->prefix}arman_followups f ON p.id = f.personnel_id GROUP BY p.id", ARRAY_A);
+                foreach ($data as $row) fputcsv($output, $row);
+                break;
+            case 'sales_by_city':
+                 fputcsv($output, ['شهر', 'تعداد سفارشات', 'درآمد (تومان)']);
+                 $data = $wpdb->get_results("SELECT cust.city, COUNT(DISTINCT f.id) as total_orders, SUM(p.price) as total_revenue FROM {$wpdb->prefix}arman_followups f JOIN {$wpdb->prefix}arman_customers cust ON f.customer_id = cust.id JOIN {$wpdb->prefix}arman_followup_products p ON f.id = p.followup_id WHERE f.final_status = 'paid' AND cust.city != '' GROUP BY cust.city", ARRAY_A);
+                 foreach ($data as $row) fputcsv($output, $row);
+                 break;
+            case 'sales_by_vehicle':
+                fputcsv($output, ['مدل ماشین', 'تعداد سفارشات', 'درآمد (تومان)']);
+                $data = $wpdb->get_results("SELECT cust.vehicle_model, COUNT(DISTINCT f.id) as total_orders, SUM(p.price) as total_revenue FROM {$wpdb->prefix}arman_followups f JOIN {$wpdb->prefix}arman_customers cust ON f.customer_id = cust.id JOIN {$wpdb->prefix}arman_followup_products p ON f.id = p.followup_id WHERE f.final_status = 'paid' AND cust.vehicle_model != '' GROUP BY cust.vehicle_model ORDER BY total_revenue DESC", ARRAY_A);
+                foreach ($data as $row) fputcsv($output, $row);
+                break;
+            case 'top_products':
+                fputcsv($output, ['نام کالا', 'تعداد فروش', 'درآمد (تومان)']);
+                $data = $wpdb->get_results("SELECT p.product_name, COUNT(p.id) as total_sales, SUM(p.price) as total_revenue FROM {$wpdb->prefix}arman_followup_products p JOIN {$wpdb->prefix}arman_followups f ON p.followup_id = f.id WHERE f.final_status = 'paid' AND p.price > 0 GROUP BY p.product_name ORDER BY total_sales DESC", ARRAY_A);
+                foreach ($data as $row) fputcsv($output, $row);
+                break;
+            case 'top_customers':
+                fputcsv($output, ['مشتری', 'شماره تماس', 'تعداد سفارشات', 'مجموع خرید (تومان)']);
+                $data = $wpdb->get_results("SELECT cust.name, cust.phone, COUNT(DISTINCT f.id) as total_orders, SUM(p.price) as total_spent FROM {$wpdb->prefix}arman_customers cust JOIN {$wpdb->prefix}arman_followups f ON cust.id = f.customer_id JOIN {$wpdb->prefix}arman_followup_products p ON f.id = p.followup_id WHERE f.final_status = 'paid' GROUP BY cust.id ORDER BY total_spent DESC", ARRAY_A);
+                foreach ($data as $row) fputcsv($output, $row);
+                break;
+        }
+
+        fclose($output);
+        exit;
+    }
+    
+    /**
+     * AJAX callback to search for customers.
+     */
+    public function search_customers_callback() {
+        global $wpdb;
+        $term = sanitize_text_field( $_GET['term'] );
+        $table_customers = $wpdb->prefix . 'arman_customers';
+        
+        $customers = $wpdb->get_results( $wpdb->prepare(
+            "SELECT * FROM $table_customers WHERE name LIKE %s OR phone LIKE %s",
+            '%' . $wpdb->esc_like( $term ) . '%',
+            '%' . $wpdb->esc_like( $term ) . '%'
+        ) );
+        
+        $results = array();
+        foreach ( $customers as $customer ) {
+            $results[] = array(
+                'label' => $customer->name . ' (' . $customer->phone . ')',
+                'value' => $customer->name,
+                'customer' => $customer,
+            );
+        }
+        
+        wp_send_json( $results );
+    }
+
+    /**
+     * AJAX callback to search for products.
+     */
+    public function search_products_callback() {
+        global $wpdb;
+        $term = sanitize_text_field( $_GET['term'] );
+        $table_products = $wpdb->prefix . 'arman_followup_products';
+        
+        $products = $wpdb->get_results( $wpdb->prepare(
+            "SELECT DISTINCT product_name FROM $table_products WHERE product_name LIKE %s",
+            '%' . $wpdb->esc_like( $term ) . '%'
+        ) );
+        
+        $results = array();
+        foreach ( $products as $product ) {
+            $results[] = $product->product_name;
+        }
+        
+        wp_send_json( $results );
+    }
+}
+
+// Instantiate the main class
+new Arman_Part_CRM();
